@@ -3,26 +3,27 @@ package sumServer
 import com.twitter.finagle.service._
 import com.twitter.finagle.util.DefaultTimer
 import com.twitter.conversions.time._
-import com.twitter.finagle.http.{Response, Status}
+import com.twitter.finagle.service.FailFastFactory.FailFast
+import com.twitter.finagle.http.{Request, Response, Status}
 import com.twitter.finagle.stats.NullStatsReceiver
 import com.twitter.finagle.thrift.ThriftServiceIface
-import com.twitter.finagle.{IndividualRequestTimeoutException, Service, SimpleFilter, Thrift}
+import com.twitter.finagle._
 import com.twitter.util._
 import sumServer.rpc.Summator
 import sumServer.rpc.Summator.Sum
 
-import scala.collection.mutable.ArrayBuffer
-
-object sumServerClient {
+object sumServerClient  {
   def main(args: Array[String]) {
     //#thriftclientapi
     val client = Thrift.client.newServiceIface[Summator.ServiceIface]("localhost:8080", "sum")
 
     def timeoutFilter[Req, Rep](duration: Duration) = {
-      val exc = new IndividualRequestTimeoutException(duration)
       val timer = DefaultTimer.twitter
-      new TimeoutFilter[Req, Rep](duration, exc, timer)
+      new TimeoutFilter[Req, Rep](duration, timer)
     }
+
+
+
 
     val multiplyTheSecond = new SimpleFilter[Sum.Args, Sum.Result] {
       def apply(req: Sum.Args, service: Service[Sum.Args, Sum.Result]): Future[Sum.Result] = {
@@ -31,46 +32,55 @@ object sumServerClient {
       }
     }
 
-    val test = timeoutFilter(2.seconds) andThen multiplyTheSecond andThen client.sum
+
+    val test = timeoutFilter(1.microseconds) andThen multiplyTheSecond andThen client.sum
+
+//    val budget: RetryBudget = RetryBudget(
+//      ttl = 10.seconds,
+//      percentCanRetry = 0.1,
+//      minRetriesPerSec = 20
+//    )
+
+//    val policy: RetryPolicy[Try[Response]] =
+//      RetryPolicy.backoff(Backoff.equalJittered(100.milliseconds, 10.seconds)) {
+//        case Return(rep) if rep.status == Status.InternalServerError => true
+//      }
+
+    val retryCondition: PartialFunction[Try[Nothing], Boolean] = {
+      case Throw(error) => error match {
+        case e: CancelledConnectionException => true
+        case e: FailedFastException => true
+        case e: com.twitter.util.TimeoutException => true
+        case e: com.twitter.finagle.IndividualRequestTimeoutException => true
+        case _ => false
+      }
+      case _ => false
+    }
+
+    val backoffs = Stream(5.seconds, 5.seconds, 5.seconds)
+    val retryPolicy = RetryPolicy.backoff(backoffs)(retryCondition)
+    def retryFilter[Req, Rep] = new RetryExceptionsFilter[Req, Rep](retryPolicy, DefaultTimer.twitter)
+
+    val retriedSum = retryFilter andThen timeoutFilter(20.milliseconds).andThen(retryFilter.andThen(client.sum))
 
 
-    val retryPolicy = RetryPolicy.tries[Try[Sum.Result]](3,
-      {
-        case Throw(_) => true
-      })
-
-    val retriedGetLogSize = new RetryExceptionsFilter(retryPolicy, DefaultTimer.twitter) andThen
-      ThriftServiceIface.resultFilter(Sum) andThen
-      client.sum
-
-    val request: Seq[Sum.Args] = Seq(Sum.Args(5,5),Sum.Args(4,4),Sum.Args(3,3),Sum.Args(2,2),Sum.Args(1,1))
-
-    val futures = request.map(arg => test(arg))
-
-
-    def selectN[A](fs: Seq[Future[A]], n: Int): Future[Seq[Try[A]]] = {
+    def selectFirsts[A](fs: Seq[Future[A]], n: Int): Future[Seq[Try[A]]] = {
       def helper(currentFutures: Seq[Future[A]], acc: Seq[Try[A]], counter: Int): Future[Seq[Try[A]]] = {
         if (counter>0 && currentFutures.nonEmpty) {
-          val result = Future.select(currentFutures)
-          result map { case (first, others) =>
-            helper(others, acc :+ first, counter - 1)
+          Future.select(currentFutures) map { case (first, others) =>
+            helper(others, first +: acc, counter - 1)
           }
-        }.flatten else Future.value(acc)
+        }.flatten else {
+          currentFutures foreach {x => x.interruptible(); x.raise(new CancelledRequestException)}
+          Future.value(acc)
+        }
       }
       helper(fs, Seq(), n)
     }
 
-    println(Await.result(selectN(futures,3)))
 
-
-
-
-    println(Await.result(test(Sum.Args(5,5))))
-
-    println(Await.result(retriedGetLogSize(Sum.Args(3,3))))
-
-
-
-
+    val futures: Seq[Sum.Args] = (0 to 100).map(_=> Sum.Args(scala.util.Random.nextInt(),scala.util.Random.nextInt()))
+    val requests = futures.map(arg => retriedSum(arg))
+    println(Await.result(selectFirsts(requests,30)))
   }
 }
