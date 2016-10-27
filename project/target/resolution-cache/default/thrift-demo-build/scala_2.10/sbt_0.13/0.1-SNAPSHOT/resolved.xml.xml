@@ -4,7 +4,7 @@
 		module="thrift-demo-build"
 		revision="0.1-SNAPSHOT"
 		status="integration"
-		publication="20161025103753"
+		publication="20161027143532"
 		e:sbtVersion="0.13" e:scalaVersion="2.10"
 	>
 		<description>
