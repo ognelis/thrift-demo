@@ -8,6 +8,8 @@ import com.twitter.finagle.http.{Request, Response, Status}
 import com.twitter.finagle.stats.NullStatsReceiver
 import com.twitter.finagle.thrift.ThriftServiceIface
 import com.twitter.finagle._
+import com.twitter.finagle.client.Transporter.ConnectTimeout
+import com.twitter.finagle.param.HighResTimer
 import com.twitter.util._
 import sumServer.rpc.Summator
 import sumServer.rpc.Summator.Sum
@@ -15,14 +17,13 @@ import sumServer.rpc.Summator.Sum
 object sumServerClient  {
   def main(args: Array[String]) {
     //#thriftclientapi
-    val client = Thrift.client.newServiceIface[Summator.ServiceIface]("localhost:8080", "sum")
+    val client = Thrift.client
 
+    val ifaceSum = client.newServiceIface[Summator.ServiceIface]("localhost:8080", "sum")
     def timeoutFilter[Req, Rep](duration: Duration) = {
       val timer = DefaultTimer.twitter
       new TimeoutFilter[Req, Rep](duration, timer)
     }
-
-
 
 
     val multiplyTheSecond = new SimpleFilter[Sum.Args, Sum.Result] {
@@ -33,35 +34,26 @@ object sumServerClient  {
     }
 
 
-    val test = timeoutFilter(1.microseconds) andThen multiplyTheSecond andThen client.sum
+    val test = timeoutFilter(1.microseconds) andThen multiplyTheSecond andThen ifaceSum.sum
 
-//    val budget: RetryBudget = RetryBudget(
-//      ttl = 10.seconds,
-//      percentCanRetry = 0.1,
-//      minRetriesPerSec = 20
-//    )
-
-//    val policy: RetryPolicy[Try[Response]] =
-//      RetryPolicy.backoff(Backoff.equalJittered(100.milliseconds, 10.seconds)) {
-//        case Return(rep) if rep.status == Status.InternalServerError => true
-//      }
 
     val retryCondition: PartialFunction[Try[Nothing], Boolean] = {
       case Throw(error) => error match {
         case e: CancelledConnectionException => true
         case e: FailedFastException => true
-        case e: com.twitter.util.TimeoutException => true
+        case e: com.twitter.util.TimeoutException => println("timeout"); true
         case e: com.twitter.finagle.IndividualRequestTimeoutException => true
-        case _ => false
+        case e => false
       }
-      case _ => false
+      case _ =>  false
     }
 
-    val backoffs = Stream(5.seconds, 5.seconds, 5.seconds)
-    val retryPolicy = RetryPolicy.backoff(backoffs)(retryCondition)
-    def retryFilter[Req, Rep] = new RetryExceptionsFilter[Req, Rep](retryPolicy, DefaultTimer.twitter)
 
-    val retriedSum = retryFilter andThen timeoutFilter(20.milliseconds).andThen(retryFilter.andThen(client.sum))
+    val retryPolicy = RetryPolicy.backoff(Backoff.equalJittered(2.seconds, 60.minutes))(retryCondition)
+    def retryFilter[Req, Rep] = new RetryExceptionsFilter[Req, Rep](retryPolicy, HighResTimer.Default)
+
+
+    val retriedSum = retryFilter andThen timeoutFilter(1.milliseconds).andThen(ifaceSum.sum)
 
 
     def selectFirsts[A](fs: Seq[Future[A]], n: Int): Future[Seq[Try[A]]] = {
@@ -79,8 +71,8 @@ object sumServerClient  {
     }
 
 
-    val futures: Seq[Sum.Args] = (0 to 100).map(_=> Sum.Args(scala.util.Random.nextInt(),scala.util.Random.nextInt()))
+    val futures: Seq[Sum.Args] = (0 to 1).map(_=> Sum.Args(scala.util.Random.nextInt(),scala.util.Random.nextInt()))
     val requests = futures.map(arg => retriedSum(arg))
-    println(Await.result(selectFirsts(requests,30)))
+    println(Await.result(Future.collect(requests)))
   }
 }
